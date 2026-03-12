@@ -1073,15 +1073,32 @@ class ChatBedrockConverse(BaseChatModel):
 
         logger.debug(f"input message to bedrock: {bedrock_messages}")
         logger.debug(f"System message to bedrock: {system}")
-        # Remove disable_streaming from kwargs as it's not a valid API parameter
+        # Remove non-API kwargs and handle response_format conversion
         filtered_kwargs = {k: v for k, v in kwargs.items() if k != "disable_streaming"}
+        
+        # Extract response_format (from ProviderStrategy) and convert to Bedrock
+        # outputConfig format before camelCase conversion mangles the keys.
+        response_format = filtered_kwargs.pop("response_format", None)
+        # strict at the top-level is not a Converse API parameter; it is only
+        # meaningful inside tool definitions (handled by bind_tools).
+        filtered_kwargs.pop("strict", None)
         additional_fields = filtered_kwargs.pop("additional_model_request_fields", None)
+
+        camel_kwargs = _snake_to_camel_keys(
+            filtered_kwargs, excluded_keys={"inputSchema", "properties", "thinking"}
+        )
+
+        # If the caller supplied a response_format (e.g. LangGraph
+        # ProviderStrategy), convert it to the Bedrock Converse outputConfig.
+        if response_format is not None and "outputConfig" not in camel_kwargs:
+            camel_kwargs["outputConfig"] = _response_format_to_output_config(
+                response_format
+            )
+
         params = self._converse_params(
             stop=stop,
             additionalModelRequestFields=additional_fields,
-            **_snake_to_camel_keys(
-                filtered_kwargs, excluded_keys={"inputSchema", "properties", "thinking"}
-            ),
+            **camel_kwargs,
         )
 
         # Check for tool blocks without toolConfig and handle conversion
@@ -1132,15 +1149,32 @@ class ChatBedrockConverse(BaseChatModel):
                 logger.debug("Applying selective guardrail to only the last turn")
                 self._apply_guard_last_turn_only(bedrock_messages)
 
-        # Remove disable_streaming from kwargs as it's not a valid API parameter
+        # Remove non-API kwargs and handle response_format conversion
         filtered_kwargs = {k: v for k, v in kwargs.items() if k != "disable_streaming"}
+        
+        # Extract response_format (from ProviderStrategy) and convert to Bedrock
+        # outputConfig format before camelCase conversion mangles the keys.
+        response_format = filtered_kwargs.pop("response_format", None)
+        # strict at the top-level is not a Converse API parameter; it is only
+        # meaningful inside tool definitions (handled by bind_tools).
+        filtered_kwargs.pop("strict", None)
         additional_fields = filtered_kwargs.pop("additional_model_request_fields", None)
+
+        camel_kwargs = _snake_to_camel_keys(
+            filtered_kwargs, excluded_keys={"inputSchema", "properties", "thinking"}
+        )
+
+        # If the caller supplied a response_format (e.g. LangGraph
+        # ProviderStrategy), convert it to the Bedrock Converse outputConfig.
+        if response_format is not None and "outputConfig" not in camel_kwargs:
+            camel_kwargs["outputConfig"] = _response_format_to_output_config(
+                response_format
+            )
+
         params = self._converse_params(
             stop=stop,
             additionalModelRequestFields=additional_fields,
-            **_snake_to_camel_keys(
-                filtered_kwargs, excluded_keys={"inputSchema", "properties", "thinking"}
-            ),
+            **camel_kwargs,
         )
 
         # Check for tool blocks without toolConfig and handle conversion
@@ -2443,6 +2477,140 @@ def _bedrock_to_lc(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 f"'reasoning_content' keys. Received:\n\n{block}"
             )
     return lc_content
+
+
+# JSON Schema keywords that Bedrock structured outputs does not support.
+_UNSUPPORTED_SCHEMA_KEYWORDS: frozenset[str] = frozenset(
+    {
+        # Numerical constraints
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        # String constraints
+        "minLength",
+        "maxLength",
+        "pattern",
+        # Array constraints (minItems 0/1 are allowed, but maxItems is not)
+        "maxItems",
+        # Object constraints (additionalProperties is handled separately)
+        "minProperties",
+        "maxProperties",
+        "patternProperties",
+        # Other unsupported
+        "if",
+        "then",
+        "else",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+    }
+)
+
+
+def _strip_unsupported_schema_keywords(schema: dict) -> None:
+    """Remove JSON Schema keywords not supported by Bedrock structured outputs.
+
+    Bedrock supports a subset of JSON Schema Draft 2020-12. Unsupported
+    validation keywords (e.g. ``minimum``, ``maxLength``) cause a 400 error.
+    This function recursively strips them so that schemas generated by
+    Pydantic (which adds ``ge``/``le`` as ``minimum``/``maximum``, etc.)
+    work without manual cleanup.
+
+    Modifies *schema* in place.
+
+    Args:
+        schema: JSON Schema dict to sanitize.
+    """
+    for key in _UNSUPPORTED_SCHEMA_KEYWORDS & set(schema.keys()):
+        del schema[key]
+
+    # minItems is only supported with values 0 and 1
+    if "minItems" in schema and schema["minItems"] not in (0, 1):
+        del schema["minItems"]
+
+    # Recurse into sub-schemas
+    for prop_schema in (schema.get("properties") or {}).values():
+        if isinstance(prop_schema, dict):
+            _strip_unsupported_schema_keywords(prop_schema)
+    if "items" in schema and isinstance(schema["items"], dict):
+        _strip_unsupported_schema_keywords(schema["items"])
+    for keyword in ("$defs", "definitions"):
+        for def_schema in (schema.get(keyword) or {}).values():
+            if isinstance(def_schema, dict):
+                _strip_unsupported_schema_keywords(def_schema)
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        for sub_schema in schema.get(keyword) or []:
+            if isinstance(sub_schema, dict):
+                _strip_unsupported_schema_keywords(sub_schema)
+
+
+def _response_format_to_output_config(
+    response_format: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert an OpenAI-style ``response_format`` to a Bedrock ``outputConfig``.
+
+    The LangGraph ``ProviderStrategy`` produces a ``response_format`` dict in
+    the OpenAI format::
+
+        {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, ...}}
+
+    The Bedrock Converse API expects the equivalent information under
+    ``outputConfig.textFormat``::
+
+        {"textFormat": {"type": "json_schema", "structure": {"jsonSchema": {
+            "name": ..., "schema": "<json-string>", "description": ...}}}}
+
+    Args:
+        response_format: OpenAI-style response format dict.
+
+    Returns:
+        A Bedrock Converse ``outputConfig`` dict.
+    """
+    if not isinstance(response_format, dict):
+        return {}
+
+    fmt_type = response_format.get("type")
+    if fmt_type != "json_schema":
+        return {}
+
+    json_schema_block = response_format.get("json_schema", {})
+    schema_obj = json_schema_block.get("schema", {})
+    schema_name = json_schema_block.get("name", "output_schema")
+    schema_description = json_schema_block.get("description", schema_name)
+
+    # Bedrock requires additionalProperties: false on all object schemas
+    # and does not support certain JSON Schema validation keywords.
+    if isinstance(schema_obj, dict):
+        schema_copy = copy.deepcopy(schema_obj)
+        _set_additional_properties_false(schema_copy)
+        _strip_unsupported_schema_keywords(schema_copy)
+    else:
+        schema_copy = schema_obj
+
+    # Bedrock expects the schema value as a JSON string.
+    schema_str = (
+        json.dumps(schema_copy) if isinstance(schema_copy, dict) else str(schema_copy)
+    )
+
+    return {
+        "textFormat": {
+            "type": "json_schema",
+            "structure": {
+                "jsonSchema": {
+                    "schema": schema_str,
+                    "name": schema_name,
+                    "description": schema_description,
+                }
+            },
+        }
+    }
 
 
 def _set_additional_properties_false(schema: dict) -> None:

@@ -34,9 +34,11 @@ from langchain_aws.chat_models.bedrock_converse import (
     _lc_content_to_bedrock,
     _messages_to_bedrock,
     _parse_stream_event,
+    _response_format_to_output_config,
     _set_additional_properties_false,
     _snake_to_camel,
     _snake_to_camel_keys,
+    _strip_unsupported_schema_keywords,
 )
 from langchain_aws.function_calling import convert_to_anthropic_tool
 
@@ -4258,3 +4260,158 @@ def test_set_additional_properties_false_deeply_nested() -> None:
         schema["$defs"]["Address"]["properties"]["coords"]["additionalProperties"]
         is False
     )
+
+def test_response_format_to_output_config_basic() -> None:
+    """Test conversion of OpenAI-style response_format to Bedrock outputConfig."""
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "MySchema",
+            "description": "A test schema",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                },
+                "required": ["name", "age"],
+            },
+        },
+    }
+    result = _response_format_to_output_config(response_format)
+    assert result["textFormat"]["type"] == "json_schema"
+    json_schema = result["textFormat"]["structure"]["jsonSchema"]
+    assert json_schema["name"] == "MySchema"
+    assert json_schema["description"] == "A test schema"
+    # Schema should be a JSON string
+    import json
+
+    parsed = json.loads(json_schema["schema"])
+    assert parsed["type"] == "object"
+    assert "name" in parsed["properties"]
+    # additionalProperties should be set to false
+    assert parsed["additionalProperties"] is False
+
+
+def test_response_format_to_output_config_strips_unsupported_keywords() -> None:
+    """Test that unsupported JSON Schema keywords are stripped during conversion."""
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Constrained",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "multipleOf": 5,
+                    },
+                    "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 50,
+                        "pattern": "^[a-z]+$",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 20},
+                        "maxItems": 10,
+                    },
+                },
+                "required": ["score", "label"],
+            },
+        },
+    }
+    result = _response_format_to_output_config(response_format)
+    import json
+
+    parsed = json.loads(result["textFormat"]["structure"]["jsonSchema"]["schema"])
+    score = parsed["properties"]["score"]
+    assert "minimum" not in score
+    assert "maximum" not in score
+    assert "multipleOf" not in score
+    assert score["type"] == "number"
+
+    label = parsed["properties"]["label"]
+    assert "minLength" not in label
+    assert "maxLength" not in label
+    assert "pattern" not in label
+    assert label["type"] == "string"
+
+    tags = parsed["properties"]["tags"]
+    assert "maxItems" not in tags
+    items = tags["items"]
+    assert "maxLength" not in items
+
+
+def test_response_format_to_output_config_non_json_schema() -> None:
+    """Test that non-json_schema response_format returns empty dict."""
+    assert _response_format_to_output_config({"type": "text"}) == {}
+    assert _response_format_to_output_config("not a dict") == {}  # type: ignore[arg-type]
+
+
+def test_strip_unsupported_schema_keywords_preserves_valid_min_items() -> None:
+    """Test that minItems 0 and 1 are preserved but other values are removed."""
+    schema: dict = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "array", "items": {"type": "string"}, "minItems": 0},
+            "b": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "c": {"type": "array", "items": {"type": "string"}, "minItems": 5},
+        },
+    }
+    _strip_unsupported_schema_keywords(schema)
+    assert schema["properties"]["a"]["minItems"] == 0
+    assert schema["properties"]["b"]["minItems"] == 1
+    assert "minItems" not in schema["properties"]["c"]
+
+
+def test_strip_unsupported_schema_keywords_recurses_defs() -> None:
+    """Test that stripping recurses into $defs and nested properties."""
+    schema: dict = {
+        "type": "object",
+        "properties": {
+            "item": {"$ref": "#/$defs/Item"},
+        },
+        "$defs": {
+            "Item": {
+                "type": "object",
+                "properties": {
+                    "price": {"type": "number", "minimum": 0, "maximum": 9999},
+                },
+            }
+        },
+    }
+    _strip_unsupported_schema_keywords(schema)
+    price = schema["$defs"]["Item"]["properties"]["price"]
+    assert "minimum" not in price
+    assert "maximum" not in price
+    assert price["type"] == "number"
+
+
+def test_generate_accepts_response_format_kwarg() -> None:
+    """Test that _generate converts response_format to outputConfig."""
+    llm = ChatBedrockConverse(
+        model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        region_name="us-west-2",
+    )
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "TestOutput",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            },
+        },
+    }
+    # Verify that _converse_params can be built without error when
+    # response_format is passed through the kwargs path.
+    params = llm._converse_params(
+        outputConfig=_response_format_to_output_config(response_format),
+    )
+    assert "outputConfig" in params
+    assert params["outputConfig"]["textFormat"]["type"] == "json_schema"
